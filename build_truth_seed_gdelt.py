@@ -174,15 +174,14 @@ def build_query_from_terms(
     intents_flat = [t for t in intent_terms if t and t.strip()]
     neg_terms = [t for t in negative_terms if t and t.strip()]
 
-
-    loc = " OR ".join(qterm(t) for t in loc_terms)
-    intent = " OR ".join(qterm(t) for t in intents_flat)
-    neg = " OR ".join(qterm(t) for t in neg_terms)
-
+    # IMPORTANT: GDELT does NOT permit negation of OR-clauses like: -(a OR b).
+    # Use individual negations instead: -a -b -"multi word"
+    neg_clause = " ".join(f"-{qterm(t)}" for t in neg_terms)
+    
     q = f"({loc}) ({intent})"
-    if neg:
-        q += f" -({neg})"
-    return q
+    if neg_clause:
+        q = f"{q} {neg_clause}"
+    return q.strip()
 
 # ----------------------------- GDELT DOC Fetch -----------------------------
 
