@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Event-first seed dataset builder (GDELT DOC 2.0 API) for airspace disruptions.
-Adds --intent-mode flag to control query length/coverage.
+Run by intent bundle with automatic sharding (no term truncation).
 
 Implements the "event-first seed recipe":
   1) Pull GDELT items for corridor locality terms + aviation disruption intent bundles
@@ -86,6 +86,11 @@ DEFAULT_HEADERS = {
     "Accept": "application/json,text/plain,*/*",
 }
 
+class QueryTooLong(RuntimeError):
+    """Raised when GDELT returns 'Your query was too short or too long.'"""
+    pass
+
+
 # ----------------------------- Utilities -----------------------------
 
 def parse_date_ymd(s: str) -> dt.datetime:
@@ -130,6 +135,10 @@ def looks_like_html(s: str) -> bool:
     s = (s or "").lstrip()
     return s.startswith("<!DOCTYPE") or s.startswith("<html") or s.startswith("<")
 
+def chunk_list(xs: List[str], n: int) -> List[List[str]]:
+    return [xs[i:i+n] for i in range(0, len(xs), n)]
+
+
 # ----------------------------- Config Loading -----------------------------
 
 def load_watchbox_terms(path: str) -> Dict[str, List[str]]:
@@ -152,10 +161,14 @@ def build_query(
     max_intent_terms: int = 40,
     max_negative_terms: int = 12,
 ) -> str:
+def build_query_from_terms(
+    locality_terms: List[str],
+    intent_terms: List[str],
+    negative_terms: List[str],
+) -> str:
     """
     Broad query:
       (locality OR ...) (intent OR ...) -(neg OR ...)
-    with hard caps to keep URL length reasonable.
     """
     def qterm(x: str) -> str:
         x = x.strip()
@@ -165,14 +178,10 @@ def build_query(
             return f'"{x}"'
         return x
 
-    loc_terms = [t for t in locality_terms if t and t.strip()][:max_locality_terms]
+    loc_terms = [t for t in locality_terms if t and t.strip()]
+    intents_flat = [t for t in intent_terms if t and t.strip()]
+    neg_terms = [t for t in negative_terms if t and t.strip()]
 
-    intents_flat: List[str] = []
-    for _, terms in intent_bundles.items():
-        intents_flat.extend([t for t in terms if t and t.strip()])
-    intents_flat = intents_flat[:max_intent_terms]
-
-    neg_terms = [t for t in negative_terms if t and t.strip()][:max_negative_terms]
 
     loc = " OR ".join(qterm(t) for t in loc_terms)
     intent = " OR ".join(qterm(t) for t in intents_flat)
@@ -222,6 +231,9 @@ def _request_json_with_retries(
                 time.sleep(max(2.0, backoff))
                 backoff *= 1.6
                 continue
+            # GDELT sometimes returns plain-text error even with format=json
+            if "too short or too long" in text.lower():
+                raise QueryTooLong(text.strip())
 
             # Some errors return HTML or empty body with 200
             if not text.strip():
@@ -336,6 +348,101 @@ def fetch_gdelt_artlist(
             break
 
     return results
+
+def fetch_with_sharding(
+    locality_terms: List[str],
+    intent_terms: List[str],
+    negative_terms: List[str],
+    start_dt: dt.datetime,
+    end_dt: dt.datetime,
+    maxrecords: int,
+    sleep_s: float,
+    max_pages: int,
+    _depth: int = 0,
+) -> List[Dict[str, Any]]:
+    """
+    Try one query. If GDELT says 'too short or too long', split terms and union.
+    No truncation: we shard locality first, then intent if needed.
+    """
+    # guard against runaway recursion
+    if _depth > 10:
+        raise RuntimeError("Exceeded sharding recursion depth; queries still rejected.")
+
+    q = build_query_from_terms(locality_terms, intent_terms, negative_terms)
+    try:
+        return fetch_gdelt_artlist(
+            query=q,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            maxrecords=maxrecords,
+            sleep_s=sleep_s,
+            max_pages=max_pages,
+        )
+    except QueryTooLong:
+        # shard locality first
+        if len(locality_terms) > 1:
+            mid = len(locality_terms) // 2
+            left = locality_terms[:mid]
+            right = locality_terms[mid:]
+            a = fetch_with_sharding(
+                left,
+                intent_terms,
+                negative_terms,
+                start_dt,
+                end_dt,
+                maxrecords,
+                sleep_s,
+                max_pages,
+                _depth=_depth + 1,
+            )
+            b = fetch_with_sharding(
+                right,
+                intent_terms,
+                negative_terms,
+                start_dt,
+                end_dt,
+                maxrecords,
+                sleep_s,
+                max_pages,
+                _depth=_depth + 1,
+            )
+            return a + b
+
+        # if locality is already 1 term, shard intent terms
+        if len(intent_terms) > 1:
+            mid = len(intent_terms) // 2
+            left = intent_terms[:mid]
+            right = intent_terms[mid:]
+            a = fetch_with_sharding(
+                locality_terms,
+                left,
+                negative_terms,
+                start_dt,
+                end_dt,
+                maxrecords,
+                sleep_s,
+                max_pages,
+                _depth=_depth + 1,
+            )
+            b = fetch_with_sharding(
+                locality_terms,
+                right,
+                negative_terms,
+                start_dt,
+                end_dt,
+                maxrecords,
+                sleep_s,
+                max_pages,
+                _depth=_depth + 1,
+            )
+            return a + b
+
+        # nothing left to split
+        raise RuntimeError(
+            "GDELT rejected even the smallest possible query (1 locality term + 1 intent term).\n"
+            f"Locality: {locality_terms}\nIntent: {intent_terms}\n"
+            "Try removing problematic locality terms (non-ASCII, punctuation) or using a different synonym.\n"
+        )
 
 def articles_to_frame(articles: List[Dict[str, Any]], box_id: str) -> pd.DataFrame:
     rows = []
@@ -663,7 +770,17 @@ def main():
       choices=["all", "core", "risk"],
       default="all",
       help="Which intent bundle set to use: all (default), core (AIRSPACE+OPS), risk (CONFLICT+GNSS).",
-  )
+    )
+    ap.add_argument(
+      "--intent-split",
+      action="store_true",
+      help="Run one intent bundle at a time (AIRSPACE/OPS/CONFLICT/GNSS), union docs, then cluster once.",
+    )
+    ap.add_argument(
+        "--intent-bundles",
+        default="AIRSPACE,OPS,CONFLICT,GNSS",
+        help="Comma-separated list of intent bundles to run when --intent-split is enabled.",
+    )
   
     ap.add_argument("--chunk-days", type=int, default=7, help="Fetch GDELT in date chunks to reduce timeouts (try 7).")
     ap.add_argument("--maxrecords", type=int, default=250, help="GDELT maxrecords per request (<=250).")
@@ -682,10 +799,6 @@ def main():
     ap.add_argument("--shock-thresh", type=float, default=0.25, help="Abs(delta_pct) threshold for count shock (broad).")
     ap.add_argument("--window-pad-hours", type=int, default=6, help="Pad hours around event window for verification.")
 
-    ap.add_argument("--max-locality-terms", type=int, default=25, help="Cap locality terms to avoid oversized queries.")
-    ap.add_argument("--max-intent-terms", type=int, default=40, help="Cap intent terms to avoid oversized queries.")
-    ap.add_argument("--max-negative-terms", type=int, default=12, help="Cap negative terms to avoid oversized queries.")
-
     ap.add_argument("--save-raw", action="store_true", help="Save raw docs CSV for debugging.")
     ap.add_argument("--raw-dir", default="raw_docs", help="Directory to store raw docs.")
     args = ap.parse_args()
@@ -698,33 +811,42 @@ def main():
 
     ranges = chunk_date_ranges(start_dt, end_dt, args.chunk_days)
 
+  bundles_to_run = ["ALL"]
+  if args.intent_split:
+      bundles_to_run = [b.strip().upper() for b in args.intent_bundles.split(",") if b.strip()]
+      for b in bundles_to_run:
+          if b not in DEFAULT_INTENT_BUNDLES:
+              raise SystemExit(f"Unknown bundle '{b}'. Valid: {list(DEFAULT_INTENT_BUNDLES.keys())}")
+
     all_docs = []
     for box_id, locality_terms in watchbox_terms.items():
         if not locality_terms:
             continue
-
-        q = build_query(
-            locality_terms=locality_terms,
-            intent_bundles=DEFAULT_INTENT_BUNDLES,
-            intent_bundles=intent_bundles,
-            negative_terms=DEFAULT_NEGATIVE_TERMS,
-            max_locality_terms=args.max_locality_terms,
-            max_intent_terms=args.max_intent_terms,
-            max_negative_terms=args.max_negative_terms,
-        )
-
+          
         box_docs_parts = []
-        for (rs, re_) in ranges:
-            arts = fetch_gdelt_artlist(
-                query=q,
-                start_dt=rs,
-                end_dt=re_,
-                maxrecords=args.maxrecords,
-                sleep_s=args.sleep,
-                max_pages=args.max_pages,
-            )
-            df_part = articles_to_frame(arts, box_id=box_id)
-            box_docs_parts.append(df_part)
+        for bundle in bundles_to_run:
+            if bundle == "ALL":
+                intent_terms: List[str] = []
+                for _, ts in DEFAULT_INTENT_BUNDLES.items():
+                    intent_terms.extend(ts)
+            else:
+                intent_terms = list(DEFAULT_INTENT_BUNDLES[bundle])
+        
+            for (rs, re_) in ranges:
+                arts = fetch_with_sharding(
+                    locality_terms=locality_terms,
+                    intent_terms=intent_terms,
+                    negative_terms=DEFAULT_NEGATIVE_TERMS,
+                    start_dt=rs,
+                    end_dt=re_,
+                    maxrecords=args.maxrecords,
+                    sleep_s=args.sleep,
+                    max_pages=args.max_pages,
+                )
+                df_part = articles_to_frame(arts, box_id=box_id)
+                if not df_part.empty:
+                    df_part["intent_bundle"] = bundle
+                box_docs_parts.append(df_part)  
 
         if box_docs_parts:
             df_box = pd.concat(box_docs_parts, ignore_index=True)
