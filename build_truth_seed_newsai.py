@@ -183,68 +183,54 @@ def _newsai_post_json(
     max_tries: int = 6,
 ) -> Tuple[Dict[str, Any], int]:
     """
-    POST JSON to NewsAPI.ai (Event Registry); returns (data, req_tokens_from_header_or_0).
-
-    Key behaviors:
-      - Handles 429/5xx with exponential backoff retries
-      - Fails fast on non-200 responses (prints helpful head)
-      - Detects non-JSON responses (HTML, redirects) before calling r.json()
-      - Never references `r` before assignment
+    POST JSON to NewsAPI.ai/EventRegistry; returns (data, req_tokens).
+    - Handles transient failures with exponential backoff
+    - Raises a clear error on non-JSON / HTML error pages
     """
-    r: Optional[requests.Response] = None
     last_err: Optional[str] = None
+    headers = {
+        "User-Agent": "airspace-disruption-event-ds-creator/1.0",
+        "Accept": "application/json,text/plain,*/*",
+    }
 
     for attempt in range(1, max_tries + 1):
+        r = None
         try:
-            r = requests.post(
-                url,
-                json=payload,
-                timeout=timeout_s,
-                allow_redirects=True,
-                headers={"Accept": "application/json"},
-            )
+            r = requests.post(url, json=payload, headers=headers, timeout=timeout_s, allow_redirects=True)
 
-            req_tokens = int((r.headers.get("req-tokens") or "0").strip() or 0)
+            ct = (r.headers.get("content-type") or "").lower()
+            req_tokens = int(r.headers.get("req-tokens", "0") or 0)
 
-            # Transient / throttling
+            # Retryable statuses
             if r.status_code in (429, 500, 502, 503, 504):
-                # Try to respect Retry-After if present
-                ra = r.headers.get("Retry-After")
-                if ra:
-                    try:
-                        backoff = float(ra)
-                    except Exception:
-                        backoff = None
-                else:
-                    backoff = None
-
-                if backoff is None:
-                    backoff = min(30.0, (2 ** (attempt - 1)) + (0.15 * attempt))
-
                 head = (r.text or "")[:300].replace("\n", " ")
-                last_err = f"HTTP {r.status_code} (tokens={req_tokens}) head={head!r}"
+                last_err = f"HTTP {r.status_code} ct={ct} head={head!r}"
+                backoff = min(30.0, (2 ** (attempt - 1)) + 0.25 * attempt)
                 time.sleep(backoff)
                 continue
 
-            # Hard fail if not OK
-            if r.status_code != 200:
+            # Hard error statuses -> raise with body head (often HTML)
+            if r.status_code >= 400:
                 head = (r.text or "")[:600].replace("\n", " ")
-                ct = r.headers.get("content-type", "")
                 raise RuntimeError(f"HTTP {r.status_code} ct={ct} head={head!r}")
 
-            # If server returns HTML, don't attempt JSON parsing
-            ct = (r.headers.get("content-type") or "").lower()
-            if "json" not in ct:
+            # Must be JSON
+            try:
+                data = r.json()
+            except Exception:
                 head = (r.text or "")[:600].replace("\n", " ")
-                raise RuntimeError(f"Non-JSON response ct={ct} head={head!r}")
+                raise RuntimeError(f"Non-JSON response (status={r.status_code}, ct={ct}). head={head!r}")
 
-            data = r.json()
-
-            # API-level errors
+            # API-level errors (JSON)
             if isinstance(data, dict) and data.get("error"):
-                raise RuntimeError(str(data.get("error")))
+                last_err = str(data.get("error"))
+                # Some errors can be transient; retry a few times
+                if attempt < max_tries:
+                    time.sleep(min(10.0, 1.5 * attempt))
+                    continue
+                raise RuntimeError(last_err)
 
-            if sleep_s > 0:
+            if sleep_s:
                 time.sleep(sleep_s)
 
             return data, req_tokens
@@ -252,28 +238,15 @@ def _newsai_post_json(
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            status = "n/a"
-            ct = "n/a"
-            head = ""
-            tokens = "0"
-
-            if r is not None:
-                status = str(r.status_code)
-                ct = str(r.headers.get("content-type", ""))
-                tokens = str(r.headers.get("req-tokens", "0"))
-                head = (r.text or "")[:600].replace("\n", " ")
-
-            last_err = f"{e} (status={status}, ct={ct}, req_tokens={tokens}, head={head!r})"
-
+            # If it was a hard error (400s, non-JSON, etc), don't hammer retries too aggressively
+            msg = str(e)
+            last_err = msg
             if attempt < max_tries:
                 time.sleep(min(15.0, 1.5 * attempt))
                 continue
-
             raise RuntimeError(f"NewsAPI.ai request failed after retries: {last_err}") from e
 
     raise RuntimeError(f"NewsAPI.ai request failed: {last_err}")
-
-
 
 def build_complex_query_from_terms(
     locality_terms: List[str],
@@ -283,22 +256,31 @@ def build_complex_query_from_terms(
     use_negatives: bool,
     date_start: str,
     date_end: str,
+    skip_duplicates: bool = True,
 ) -> Dict[str, Any]:
-    def or_keywords(terms: List[str]) -> Dict[str, Any]:
-        return {"$or": [{"keyword": t} for t in terms]}
-
     clauses: List[Dict[str, Any]] = []
+
+    # date range as a condition
     clauses.append({"dateStart": date_start, "dateEnd": date_end})
 
     if locality_terms:
-        clauses.append(or_keywords(locality_terms))
+        clauses.append({"keyword": {"$or": locality_terms}})
     if intent_terms:
-        clauses.append(or_keywords(intent_terms))
+        clauses.append({"keyword": {"$or": intent_terms}})
 
     if use_negatives and negative_terms:
-        clauses.append({"$not": or_keywords(negative_terms)})
+        clauses.append({"$not": {"keyword": {"$or": negative_terms}}})
 
-    return {"$query": {"$and": clauses}}
+    q = clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+    out: Dict[str, Any] = {"$query": q}
+
+    # IMPORTANT: duplicate handling belongs in $filter, not as top-level isDuplicateFilter
+    if skip_duplicates:
+        out["$filter"] = {"isDuplicate": "skipDuplicates"}  # :contentReference[oaicite:1]{index=1}
+
+    return out
+
 
 
 def cache_path(raw_dir: str, cache_key: str) -> str:
@@ -332,15 +314,12 @@ def fetch_newsai_articles(
     page = 1
     while page <= max_pages:
         payload = {
-            "action": "getArticles",
             "apiKey": token,
             "query": query,
             "articlesCount": int(maxrecords),
             "articlesPage": int(page),
             "articlesSortBy": "date",
             "articlesSortByAsc": True,
-            # De-dup behavior tends to reduce waste; server may ignore if unsupported
-            "isDuplicateFilter": "skipDuplicates",
         }
 
         cache_key = sha1_json({"url": url, "payload": payload})
