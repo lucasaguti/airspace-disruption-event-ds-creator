@@ -160,28 +160,33 @@ def build_query_from_terms(
 ) -> str:
     """
     Broad query:
-      (locality OR ...) (intent OR ...) -(neg OR ...)
+      (locality OR ...) (intent OR ...)  -neg1 -neg2 -"..."
+    IMPORTANT: GDELT does NOT permit negation of OR clauses like: -(a OR b).
+    Use individual negations instead.
     """
     def qterm(x: str) -> str:
-        x = x.strip()
+        x = (x or "").strip()
         if not x:
             return ""
         if " " in x:
             return f'"{x}"'
         return x
 
-    loc_terms = [t for t in locality_terms if t and t.strip()]
-    intents_flat = [t for t in intent_terms if t and t.strip()]
-    neg_terms = [t for t in negative_terms if t and t.strip()]
+    loc_terms = [t for t in locality_terms if (t or "").strip()]
+    intents_flat = [t for t in intent_terms if (t or "").strip()]
+    neg_terms = [t for t in negative_terms if (t or "").strip()]
 
-    # IMPORTANT: GDELT does NOT permit negation of OR-clauses like: -(a OR b).
-    # Use individual negations instead: -a -b -"multi word"
-    neg_clause = " ".join(f"-{qterm(t)}" for t in neg_terms)
-    
+    loc = " OR ".join(qterm(t) for t in loc_terms)
+    intent = " OR ".join(qterm(t) for t in intents_flat)
+
+    # Individual negations (no -(a OR b))
+    neg_clause = " ".join(f"-{qterm(t)}" for t in neg_terms if qterm(t))
+
     q = f"({loc}) ({intent})"
     if neg_clause:
         q = f"{q} {neg_clause}"
     return q.strip()
+
 
 # ----------------------------- GDELT DOC Fetch -----------------------------
 
