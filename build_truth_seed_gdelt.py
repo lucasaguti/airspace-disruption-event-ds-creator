@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Event-first seed dataset builder (GDELT DOC 2.0 API) for airspace disruptions.
+Adds --intent-mode flag to control query length/coverage.
 
 Implements the "event-first seed recipe":
   1) Pull GDELT items for corridor locality terms + aviation disruption intent bundles
@@ -60,6 +61,20 @@ DEFAULT_INTENT_BUNDLES = {
         "GPS jamming", "GNSS interference", "GPS spoofing", "GNSS spoofing"
     ]
 }
+
+def select_intent_bundles(mode: str) -> Dict[str, List[str]]:
+    """
+    intent-mode:
+      - all  : AIRSPACE + OPS + CONFLICT + GNSS (default)
+      - core : AIRSPACE + OPS (closures / NOTAM / reroutes / ATC outages)
+      - risk : CONFLICT + GNSS (missiles/drones + GPS/GNSS interference)
+    """
+    m = (mode or "all").lower().strip()
+    if m == "core":
+        return {k: DEFAULT_INTENT_BUNDLES[k] for k in ["AIRSPACE", "OPS"] if k in DEFAULT_INTENT_BUNDLES}
+    if m == "risk":
+        return {k: DEFAULT_INTENT_BUNDLES[k] for k in ["CONFLICT", "GNSS"] if k in DEFAULT_INTENT_BUNDLES}
+    return DEFAULT_INTENT_BUNDLES
 
 DEFAULT_NEGATIVE_TERMS = [
     "plane crash", "air crash", "aircraft crash", "accident", "fatalities",
@@ -643,6 +658,13 @@ def main():
     ap.add_argument("--start-date", required=True, help="UTC start date YYYY-MM-DD (inclusive).")
     ap.add_argument("--end-date", required=True, help="UTC end date YYYY-MM-DD (exclusive).")
 
+    ap.add_argument(
+      "--intent-mode",
+      choices=["all", "core", "risk"],
+      default="all",
+      help="Which intent bundle set to use: all (default), core (AIRSPACE+OPS), risk (CONFLICT+GNSS).",
+  )
+  
     ap.add_argument("--chunk-days", type=int, default=7, help="Fetch GDELT in date chunks to reduce timeouts (try 7).")
     ap.add_argument("--maxrecords", type=int, default=250, help="GDELT maxrecords per request (<=250).")
     ap.add_argument("--sleep", type=float, default=1.2, help="Sleep seconds between API calls (increase if 429).")
@@ -672,6 +694,8 @@ def main():
     start_dt = parse_date_ymd(args.start_date)
     end_dt = parse_date_ymd(args.end_date)
 
+    intent_bundles = select_intent_bundles(args.intent_mode)
+
     ranges = chunk_date_ranges(start_dt, end_dt, args.chunk_days)
 
     all_docs = []
@@ -682,6 +706,7 @@ def main():
         q = build_query(
             locality_terms=locality_terms,
             intent_bundles=DEFAULT_INTENT_BUNDLES,
+            intent_bundles=intent_bundles,
             negative_terms=DEFAULT_NEGATIVE_TERMS,
             max_locality_terms=args.max_locality_terms,
             max_intent_terms=args.max_intent_terms,
