@@ -445,6 +445,11 @@ def fetch_with_sharding(
         )
 
 def articles_to_frame(articles: List[Dict[str, Any]], box_id: str) -> pd.DataFrame:
+    # Always return a DF with consistent columns
+    cols = ["box_id", "url", "title", "title_norm", "domain", "language", "published_utc"]
+    if not articles:
+        return pd.DataFrame(columns=cols)
+
     rows = []
     for a in articles:
         url = a.get("url") or ""
@@ -477,8 +482,14 @@ def articles_to_frame(articles: List[Dict[str, Any]], box_id: str) -> pd.DataFra
             "published_utc": published.isoformat().replace("+00:00", "Z") if published else "",
         })
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=cols)
+
+    # Guard: even if all urls are blank, keep schema and return empty
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
     return df[df["url"].astype(bool)]
+
 
 # ----------------------------- Ranking + Clustering -----------------------------
 
