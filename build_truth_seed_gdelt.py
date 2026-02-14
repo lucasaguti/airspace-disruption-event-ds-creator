@@ -153,43 +153,44 @@ def load_watchbox_terms(path: str) -> Dict[str, List[str]]:
 
 # ----------------------------- Query Building -----------------------------
 
-def build_query_from_terms(
-    locality_terms: List[str],
-    intent_terms: List[str],
-    negative_terms: List[str],
-) -> str:
-    """
-    GDELT rules:
-      - Parentheses may only be used around OR'd statements.
-      - Negation of OR clauses is not permitted (so use -term -term ...).
-    """
+def build_query_from_terms(locality_terms, intent_terms, negative_terms):
     def qterm(x: str) -> str:
         x = (x or "").strip()
         if not x:
             return ""
-        return f'"{x}"' if " " in x else x
+        # quote phrases
+        if " " in x or "-" in x:
+            return f"\"{x}\""
+        return x
 
-    loc_terms = [t for t in locality_terms if (t or "").strip()]
-    int_terms = [t for t in intent_terms if (t or "").strip()]
-    neg_terms = [t for t in negative_terms if (t or "").strip()]
+    def or_group(terms):
+        terms = [qterm(t) for t in terms if (t and str(t).strip())]
+        terms = [t for t in terms if t]
+        if not terms:
+            return ""
+        if len(terms) == 1:
+            return terms[0]              # <-- NO PARENTHESES for single term
+        return "(" + " OR ".join(terms) + ")"
 
-    loc = " OR ".join(qterm(t) for t in loc_terms if qterm(t))
-    intent = " OR ".join(qterm(t) for t in int_terms if qterm(t))
+    loc = or_group(locality_terms)
+    intent = or_group(intent_terms)
 
-    if not loc or not intent:
-        raise ValueError("Empty locality or intent terms after cleaning.")
+    # negatives MUST be individual -term tokens (no -(a OR b))
+    negs = []
+    for t in (negative_terms or []):
+        qt = qterm(t)
+        if qt:
+            negs.append(f"-{qt}")
 
-    # Only wrap in parentheses if there is an OR (GDELT rule)
-    loc_expr = f"({loc})" if " OR " in loc else loc
-    intent_expr = f"({intent})" if " OR " in intent else intent
+    parts = []
+    if loc:
+        parts.append(loc)
+    if intent:
+        parts.append(intent)
+    parts.extend(negs)
 
-    # Individual negations (no -(a OR b))
-    neg_clause = " ".join(f"-{qterm(t)}" for t in neg_terms if qterm(t))
+    return " ".join(parts).strip()
 
-    q = f"{loc_expr} {intent_expr}"
-    if neg_clause:
-        q = f"{q} {neg_clause}"
-    return q.strip()
 
 
 # ----------------------------- GDELT DOC Fetch -----------------------------
@@ -792,6 +793,12 @@ def main():
         default="AIRSPACE,OPS,CONFLICT,GNSS",
         help="Comma-separated list of intent bundles to run when --intent-split is enabled.",
     )
+    ap.add_argument(
+        "--intent-shard-size",
+        type=int,
+        default=4,
+        help="Shard intent terms into groups of this size (avoids GDELT query limits).",
+    )
   
     ap.add_argument("--chunk-days", type=int, default=7, help="Fetch GDELT in date chunks to reduce timeouts (try 7).")
     ap.add_argument("--maxrecords", type=int, default=250, help="GDELT maxrecords per request (<=250).")
@@ -854,29 +861,40 @@ def main():
         for bundle in bundles_to_run:
             if bundle == "ALL":
                 intent_terms: List[str] = []
-                for _, ts in DEFAULT_INTENT_BUNDLES.items():
+                for _, ts in intent_bundles.items():
                     intent_terms.extend(ts)
             else:
-                intent_terms = list(DEFAULT_INTENT_BUNDLES[bundle])
+                intent_terms = list(intent_bundles[bundle])
         
+            intent_shards = chunk_list(intent_terms, args.intent_shard_size)
+
             for (rs, re_) in ranges:
-                for loc_shard in loc_shards:
-                    print(f"[fetch] box={box_id} bundle={bundle} range={rs.date()}..{re_.date()} loc_shard={len(loc_shard)}", flush=True)
-                    arts = fetch_with_sharding(
-                        locality_terms=loc_shard,
-                        intent_terms=intent_terms,
-                        negative_terms=DEFAULT_NEGATIVE_TERMS,  # or [] if you want none
-                        start_dt=rs,
-                        end_dt=re_,
-                        maxrecords=args.maxrecords,
-                        sleep_s=args.sleep,
-                        max_pages=args.max_pages,
-                    )
-                    df_part = articles_to_frame(arts, box_id=box_id)
-                    if df_part.empty:
-                        continue
-                    df_part["intent_bundle"] = bundle
-                    box_docs_parts.append(df_part)  
+                for li, loc_shard in enumerate(loc_shards, 1):
+                    for ii, intent_shard in enumerate(intent_shards, 1):
+                        print(
+                            f"[fetch] box={box_id} bundle={bundle} "
+                            f"range={rs.date()}..{re_.date()} "
+                            f"loc={li}/{len(loc_shards)} intent={ii}/{len(intent_shards)} "
+                            f"L={len(loc_shard)} I={len(intent_shard)}",
+                            flush=True
+                        )
+            
+                        arts = fetch_with_sharding(
+                            locality_terms=loc_shard,
+                            intent_terms=intent_shard,
+                            negative_terms=(DEFAULT_NEGATIVE_TERMS if args.use_negatives else []),
+                            start_dt=rs,
+                            end_dt=re_,
+                            maxrecords=args.maxrecords,
+                            sleep_s=args.sleep,
+                            max_pages=args.max_pages,
+                        )
+            
+                        df_part = articles_to_frame(arts, box_id=box_id)
+                        if df_part.empty:
+                            continue
+                        df_part["intent_bundle"] = bundle
+                        box_docs_parts.append(df_part)
 
         if box_docs_parts:
             df_box = pd.concat(box_docs_parts, ignore_index=True)
