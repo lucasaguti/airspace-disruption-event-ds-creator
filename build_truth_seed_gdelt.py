@@ -803,12 +803,12 @@ def main():
 
     ranges = chunk_date_ranges(start_dt, end_dt, args.chunk_days)
 
-  bundles_to_run = ["ALL"]
-  if args.intent_split:
-      bundles_to_run = [b.strip().upper() for b in args.intent_bundles.split(",") if b.strip()]
-      for b in bundles_to_run:
-          if b not in DEFAULT_INTENT_BUNDLES:
-              raise SystemExit(f"Unknown bundle '{b}'. Valid: {list(DEFAULT_INTENT_BUNDLES.keys())}")
+    bundles_to_run = ["ALL"]
+    if args.intent_split:
+        bundles_to_run = [b.strip().upper() for b in args.intent_bundles.split(",") if b.strip()]
+        for b in bundles_to_run:
+            if b not in DEFAULT_INTENT_BUNDLES:
+                raise SystemExit(f"Unknown bundle '{b}'. Valid: {list(DEFAULT_INTENT_BUNDLES.keys())}")
 
     all_docs = []
     for box_id, locality_terms in watchbox_terms.items():
