@@ -806,12 +806,6 @@ def main():
     )
 
     ap.add_argument(
-    "--loc-shard-size",
-    type=int,
-    default=4,
-    help="Shard locality terms into groups of this size (no terms dropped; avoids 'query too long').",
-    )
-    ap.add_argument(
         "--use-negatives",
         action="store_true",
         help="Include query-level negative terms (adds length; can trigger GDELT syntax limits). Default: off.",
