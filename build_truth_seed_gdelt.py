@@ -844,6 +844,7 @@ def main():
                 intent_terms = list(DEFAULT_INTENT_BUNDLES[bundle])
         
             for (rs, re_) in ranges:
+                print(f"[fetch] box={box_id} bundle={bundle} range={rs.date()}..{re_.date()}", flush=True)
                 arts = fetch_with_sharding(
                     locality_terms=locality_terms,
                     intent_terms=intent_terms,
@@ -855,6 +856,8 @@ def main():
                     max_pages=args.max_pages,
                 )
                 df_part = articles_to_frame(arts, box_id=box_id)
+                if df_part.empty:
+                    continue
                 if not df_part.empty:
                     df_part["intent_bundle"] = bundle
                 box_docs_parts.append(df_part)  
