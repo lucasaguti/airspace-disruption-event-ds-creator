@@ -40,6 +40,9 @@ import pandas as pd
 import requests
 from urllib.parse import urlparse
 
+DEFAULT_NEWS_AI_ENDPOINT = "https://eventregistry.org"
+ENDPOINT_ENV = "NEWS_AI_ENDPOINT"
+
 # ---------------------------
 # Intents (same idea as your GDELT script)
 # ---------------------------
@@ -153,7 +156,17 @@ class TokenBudget:
         return (self.burned + int(n)) > self.max_burn
 
 def _newsai_base() -> str:
-    return os.getenv("NEWS_AI_ENDPOINT", "https://newsapi.ai").rstrip("/")
+    return os.getenv(ENDPOINT_ENV, DEFAULT_NEWS_AI_ENDPOINT).strip().rstrip("/")
+
+
+def _newsai_getarticles_url() -> str:
+    base = _newsai_base()
+    if base.endswith("/api/v1/article/getArticles"):
+        return base
+    if base.endswith("/api/v1/article"):
+        return base + "/getArticles"
+    return base + "/api/v1/article/getArticles"
+
 
 def _newsai_token() -> str:
     tok = os.getenv("NEWSAPI_AI_TOKEN", "").strip()
@@ -161,36 +174,31 @@ def _newsai_token() -> str:
         raise SystemExit("Missing env var NEWSAPI_AI_TOKEN.")
     return tok
 
-def _newsai_post_json(url: str, payload: Dict[str, Any], *, timeout_s: int = 60, sleep_s: float = 0.0,
-                      max_tries: int = 6) -> Tuple[Dict[str, Any], int]:
-    """
-    POST JSON to NewsAPI.ai; returns (data, req_tokens_from_header_or_0).
-    Handles transient failures with exponential backoff.
-    """
-    last_err: Optional[str] = None
+def _newsai_post_json(...):
+    last_err = None
+    r = None
     for attempt in range(1, max_tries + 1):
         try:
-            r = requests.post(url, json=payload, timeout=timeout_s)
-            # Token usage header (Event Registry uses 'req-tokens')
+            r = requests.post(url, json=payload, timeout=timeout_s, allow_redirects=True)
+
             req_tokens = int(r.headers.get("req-tokens", "0") or 0)
 
-            # Handle rate limits / transient issues
             if r.status_code in (429, 500, 502, 503, 504):
                 last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-                backoff = min(30.0, (2 ** (attempt - 1)) + (0.1 * attempt))
-                time.sleep(backoff)
+                time.sleep(min(30.0, (2 ** (attempt - 1)) + (0.1 * attempt)))
                 continue
 
-            # Parse JSON; NewsAPI.ai may return JSON with "error"
+            # HARD FAIL if not OK
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+
+            ct = (r.headers.get("content-type") or "").lower()
+            if "json" not in ct:
+                raise RuntimeError(f"Non-JSON content-type={ct} head={r.text[:300]!r}")
+
             data = r.json()
             if isinstance(data, dict) and data.get("error"):
-                # treat as hard error unless transient
-                last_err = str(data.get("error"))
-                # Some errors can occur during overload; retry a couple times
-                if attempt < max_tries:
-                    time.sleep(min(10.0, 1.5 * attempt))
-                    continue
-                raise RuntimeError(last_err)
+                raise RuntimeError(str(data["error"]))
 
             if sleep_s > 0:
                 time.sleep(sleep_s)
@@ -199,41 +207,45 @@ def _newsai_post_json(url: str, payload: Dict[str, Any], *, timeout_s: int = 60,
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            last_err = str(e)
+            head = ""
+            status = "n/a"
+            ct = "n/a"
+            if r is not None:
+                status = str(r.status_code)
+                ct = str(r.headers.get("content-type", ""))
+                head = (r.text or "")[:300].replace("\n", " ")
+            last_err = f"{e} (status={status}, ct={ct}, head={head!r})"
             if attempt < max_tries:
                 time.sleep(min(15.0, 1.5 * attempt))
                 continue
             raise RuntimeError(f"NewsAPI.ai request failed after retries: {last_err}") from e
 
-    raise RuntimeError(f"NewsAPI.ai request failed: {last_err}")
 
-def build_complex_query_from_terms(locality_terms: List[str], intent_terms: List[str], *,
-                                  negative_terms: List[str], use_negatives: bool,
-                                  date_start: str, date_end: str) -> Dict[str, Any]:
-    """
-    Build a ComplexArticleQuery-like structure:
-      query = {"$query": {"$and": [dateClause, localityClause, intentClause, optionalNotClause]}}
-    This mirrors the Event Registry query language used by their SDK (QueryItems).
-    """
+def build_complex_query_from_terms(
+    locality_terms: List[str],
+    intent_terms: List[str],
+    *,
+    negative_terms: List[str],
+    use_negatives: bool,
+    date_start: str,
+    date_end: str,
+) -> Dict[str, Any]:
+    def or_keywords(terms: List[str]) -> Dict[str, Any]:
+        return {"$or": [{"keyword": t} for t in terms]}
+
     clauses: List[Dict[str, Any]] = []
-
-    # Date clause (kept separate so sharding doesn't change it)
     clauses.append({"dateStart": date_start, "dateEnd": date_end})
 
     if locality_terms:
-        clauses.append({"keyword": {"$or": locality_terms}})
+        clauses.append(or_keywords(locality_terms))
     if intent_terms:
-        clauses.append({"keyword": {"$or": intent_terms}})
+        clauses.append(or_keywords(intent_terms))
 
     if use_negatives and negative_terms:
-        clauses.append({"$not": {"keyword": {"$or": negative_terms}}})
+        clauses.append({"$not": or_keywords(negative_terms)})
 
-    if len(clauses) == 1:
-        q = clauses[0]
-    else:
-        q = {"$and": clauses}
+    return {"$query": {"$and": clauses}}
 
-    return {"$query": q}
 
 def cache_path(raw_dir: str, cache_key: str) -> str:
     safe_mkdir(raw_dir)
@@ -258,7 +270,7 @@ def fetch_newsai_articles(
     """
     base = _newsai_base()
     token = _newsai_token()
-    url = f"{base}/api/v1/article"  # SDK uses /api/v1/article with action=getArticles
+    url = _newsai_getarticles_url()
 
     out: List[Dict[str, Any]] = []
 
