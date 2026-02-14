@@ -199,12 +199,12 @@ def _newsai_suggest_locations_fast(endpoint_base: str, api_key: str, text: str) 
         "apiKey": api_key,
         "prefix": text,
         "count": 1,
+        "lang": "eng",  # REQUIRED
     }
     data, _ = _newsai_post_json(url, payload, timeout_s=30, sleep_s=0.0)
     locs = data.get("locations") or []
     if not locs:
         return None
-    # EventRegistry uses wikiUri for locations
     return (locs[0].get("wikiUri") or "").strip() or None
 
 
@@ -215,14 +215,14 @@ def _newsai_suggest_concepts_fast(endpoint_base: str, api_key: str, text: str) -
         "apiKey": api_key,
         "prefix": text,
         "count": 1,
-        "conceptLang": "eng",
+        "lang": "eng",        # REQUIRED
+        "conceptLang": "eng", # keep (fine)
     }
     data, _ = _newsai_post_json(url, payload, timeout_s=30, sleep_s=0.0)
     cs = data.get("concepts") or []
     if not cs:
         return None
     return (cs[0].get("uri") or "").strip() or None
-
 
 def _load_json(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
