@@ -799,6 +799,13 @@ def main():
     ap.add_argument("--max-pages", type=int, default=120, help="Max paging iterations per chunk (reduce if throttled).")
 
     ap.add_argument(
+        "--loc-shard-size",
+        type=int,
+        default=4,
+        help="Shard locality terms into groups of this size (no terms dropped).",
+    )
+
+    ap.add_argument(
     "--loc-shard-size",
     type=int,
     default=4,
@@ -843,6 +850,7 @@ def main():
 
     all_docs = []
     for box_id, locality_terms in watchbox_terms.items():
+        loc_shards = [locality_terms[i:i+args.loc_shard_size] for i in range(0, len(locality_terms), args.loc_shard_size)]
         if not locality_terms:
             continue
 
@@ -859,15 +867,11 @@ def main():
         
             for (rs, re_) in ranges:
                 for loc_shard in loc_shards:
-                    print(
-                        f"[fetch] box={box_id} bundle={bundle} range={rs.date()}..{re_.date()} "
-                        f"loc_shard={len(loc_shard)}",
-                        flush=True,
-                    )
+                    print(f"[fetch] box={box_id} bundle={bundle} range={rs.date()}..{re_.date()} loc_shard={len(loc_shard)}", flush=True)
                     arts = fetch_with_sharding(
                         locality_terms=loc_shard,
                         intent_terms=intent_terms,
-                        negative_terms=(DEFAULT_NEGATIVE_TERMS if args.use_negatives else []),
+                        negative_terms=DEFAULT_NEGATIVE_TERMS,  # or [] if you want none
                         start_dt=rs,
                         end_dt=re_,
                         maxrecords=args.maxrecords,
@@ -878,8 +882,7 @@ def main():
                     if df_part.empty:
                         continue
                     df_part["intent_bundle"] = bundle
-                    box_docs_parts.append(df_part)
-  
+                    box_docs_parts.append(df_part)  
 
         if box_docs_parts:
             df_box = pd.concat(box_docs_parts, ignore_index=True)
