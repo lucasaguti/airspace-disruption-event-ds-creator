@@ -174,51 +174,105 @@ def _newsai_token() -> str:
         raise SystemExit("Missing env var NEWSAPI_AI_TOKEN.")
     return tok
 
-def _newsai_post_json(...):
-    last_err = None
-    r = None
+def _newsai_post_json(
+    url: str,
+    payload: Dict[str, Any],
+    *,
+    timeout_s: int = 60,
+    sleep_s: float = 0.0,
+    max_tries: int = 6,
+) -> Tuple[Dict[str, Any], int]:
+    """
+    POST JSON to NewsAPI.ai (Event Registry); returns (data, req_tokens_from_header_or_0).
+
+    Key behaviors:
+      - Handles 429/5xx with exponential backoff retries
+      - Fails fast on non-200 responses (prints helpful head)
+      - Detects non-JSON responses (HTML, redirects) before calling r.json()
+      - Never references `r` before assignment
+    """
+    r: Optional[requests.Response] = None
+    last_err: Optional[str] = None
+
     for attempt in range(1, max_tries + 1):
         try:
-            r = requests.post(url, json=payload, timeout=timeout_s, allow_redirects=True)
+            r = requests.post(
+                url,
+                json=payload,
+                timeout=timeout_s,
+                allow_redirects=True,
+                headers={"Accept": "application/json"},
+            )
 
-            req_tokens = int(r.headers.get("req-tokens", "0") or 0)
+            req_tokens = int((r.headers.get("req-tokens") or "0").strip() or 0)
 
+            # Transient / throttling
             if r.status_code in (429, 500, 502, 503, 504):
-                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-                time.sleep(min(30.0, (2 ** (attempt - 1)) + (0.1 * attempt)))
+                # Try to respect Retry-After if present
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try:
+                        backoff = float(ra)
+                    except Exception:
+                        backoff = None
+                else:
+                    backoff = None
+
+                if backoff is None:
+                    backoff = min(30.0, (2 ** (attempt - 1)) + (0.15 * attempt))
+
+                head = (r.text or "")[:300].replace("\n", " ")
+                last_err = f"HTTP {r.status_code} (tokens={req_tokens}) head={head!r}"
+                time.sleep(backoff)
                 continue
 
-            # HARD FAIL if not OK
+            # Hard fail if not OK
             if r.status_code != 200:
-                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+                head = (r.text or "")[:600].replace("\n", " ")
+                ct = r.headers.get("content-type", "")
+                raise RuntimeError(f"HTTP {r.status_code} ct={ct} head={head!r}")
 
+            # If server returns HTML, don't attempt JSON parsing
             ct = (r.headers.get("content-type") or "").lower()
             if "json" not in ct:
-                raise RuntimeError(f"Non-JSON content-type={ct} head={r.text[:300]!r}")
+                head = (r.text or "")[:600].replace("\n", " ")
+                raise RuntimeError(f"Non-JSON response ct={ct} head={head!r}")
 
             data = r.json()
+
+            # API-level errors
             if isinstance(data, dict) and data.get("error"):
-                raise RuntimeError(str(data["error"]))
+                raise RuntimeError(str(data.get("error")))
 
             if sleep_s > 0:
                 time.sleep(sleep_s)
+
             return data, req_tokens
 
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            head = ""
             status = "n/a"
             ct = "n/a"
+            head = ""
+            tokens = "0"
+
             if r is not None:
                 status = str(r.status_code)
                 ct = str(r.headers.get("content-type", ""))
-                head = (r.text or "")[:300].replace("\n", " ")
-            last_err = f"{e} (status={status}, ct={ct}, head={head!r})"
+                tokens = str(r.headers.get("req-tokens", "0"))
+                head = (r.text or "")[:600].replace("\n", " ")
+
+            last_err = f"{e} (status={status}, ct={ct}, req_tokens={tokens}, head={head!r})"
+
             if attempt < max_tries:
                 time.sleep(min(15.0, 1.5 * attempt))
                 continue
+
             raise RuntimeError(f"NewsAPI.ai request failed after retries: {last_err}") from e
+
+    raise RuntimeError(f"NewsAPI.ai request failed: {last_err}")
+
 
 
 def build_complex_query_from_terms(
