@@ -153,14 +153,6 @@ def load_watchbox_terms(path: str) -> Dict[str, List[str]]:
 
 # ----------------------------- Query Building -----------------------------
 
-def build_query(
-    locality_terms: List[str],
-    intent_bundles: Dict[str, List[str]],
-    negative_terms: List[str],
-    max_locality_terms: int = 25,
-    max_intent_terms: int = 40,
-    max_negative_terms: int = 12,
-) -> str:
 def build_query_from_terms(
     locality_terms: List[str],
     intent_terms: List[str],
