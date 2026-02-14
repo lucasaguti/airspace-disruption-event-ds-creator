@@ -174,6 +174,24 @@ def _newsai_token() -> str:
         raise SystemExit("Missing env var NEWSAPI_AI_TOKEN.")
     return tok
 
+def _parse_req_tokens(v: Any) -> int:
+    """
+    Event Registry may return req-tokens like '1', '1.000', or even ''.
+    Convert safely to an integer token count.
+    """
+    if v is None:
+        return 0
+    s = str(v).strip()
+    if not s:
+        return 0
+    try:
+        # handles "1.000"
+        return int(float(s))
+    except Exception:
+        # last resort: keep digits only
+        digits = "".join(ch for ch in s if ch.isdigit())
+        return int(digits) if digits else 0
+
 def _newsai_post_json(
     url: str,
     payload: Dict[str, Any],
@@ -199,7 +217,7 @@ def _newsai_post_json(
             r = requests.post(url, json=payload, headers=headers, timeout=timeout_s, allow_redirects=True)
 
             ct = (r.headers.get("content-type") or "").lower()
-            req_tokens = int(r.headers.get("req-tokens", "0") or 0)
+            req_tokens = _parse_req_tokens(r.headers.get("req-tokens", "0"))
 
             # Retryable statuses
             if r.status_code in (429, 500, 502, 503, 504):
