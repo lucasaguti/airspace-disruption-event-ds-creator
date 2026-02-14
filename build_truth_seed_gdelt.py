@@ -90,6 +90,8 @@ class QueryTooLong(RuntimeError):
     """Raised when GDELT returns 'Your query was too short or too long.'"""
     pass
 
+class QueryOverflow(RuntimeError):
+    pass
 
 # ----------------------------- Utilities -----------------------------
 
@@ -303,6 +305,11 @@ def fetch_gdelt_artlist(
         }
 
         data = _request_json_with_retries(params=params, sleep_s=sleep_s)
+
+        total = data.get("totalArticles") or data.get("totalarticles") or 0
+        if total and total > (maxrecords * max_pages):
+            raise QueryOverflow(f"totalArticles={total} exceeds cap={maxrecords * max_pages}")
+
         articles = data.get("articles", []) or []
         if not articles:
             break
@@ -379,35 +386,24 @@ def fetch_with_sharding(
             sleep_s=sleep_s,
             max_pages=max_pages,
         )
-    except QueryTooLong:
-        # shard locality first
-        if len(locality_terms) > 1:
-            mid = len(locality_terms) // 2
-            left = locality_terms[:mid]
-            right = locality_terms[mid:]
-            a = fetch_with_sharding(
-                left,
-                intent_terms,
-                negative_terms,
-                start_dt,
-                end_dt,
-                maxrecords,
-                sleep_s,
-                max_pages,
-                _depth=_depth + 1,
+    except QueryOverflow:
+        span = end_dt - start_dt
+        # stop splitting if already very small (e.g., <= 2 days)
+        if span.total_seconds() <= 2 * 24 * 3600:
+            # last resort: allow deeper paging for tiny windows
+            return fetch_gdelt_artlist(
+                query=q,
+                start_dt=start_dt,
+                end_dt=end_dt,
+                maxrecords=maxrecords,
+                sleep_s=sleep_s,
+                max_pages=max_pages * 4,
             )
-            b = fetch_with_sharding(
-                right,
-                intent_terms,
-                negative_terms,
-                start_dt,
-                end_dt,
-                maxrecords,
-                sleep_s,
-                max_pages,
-                _depth=_depth + 1,
-            )
-            return a + b
+        mid = start_dt + span / 2
+        a = fetch_with_sharding(locality_terms, intent_terms, negative_terms, start_dt, mid, maxrecords, sleep_s, max_pages, _depth=_depth+1)
+        b = fetch_with_sharding(locality_terms, intent_terms, negative_terms, mid, end_dt, maxrecords, sleep_s, max_pages, _depth=_depth+1)
+        return a + b
+
 
         # if locality is already 1 term, shard intent terms
         if len(intent_terms) > 1:
