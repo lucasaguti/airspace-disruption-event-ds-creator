@@ -201,104 +201,110 @@ def _newsai_post_json(
     max_tries: int = 6,
 ) -> Tuple[Dict[str, Any], int]:
     """
-    POST JSON to NewsAPI.ai/EventRegistry; returns (data, req_tokens).
-    - Handles transient failures with exponential backoff
-    - Raises a clear error on non-JSON / HTML error pages
+    POST JSON to NewsAPI.ai (Event Registry). Returns (data, req_tokens).
+    Robust to:
+      - HTML error bodies
+      - JSON bodies with {"error": "..."}
+      - req-tokens header formatted as '1.000'
+      - transient 429/5xx retry with backoff
     """
     last_err: Optional[str] = None
-    headers = {
-        "User-Agent": "airspace-disruption-event-ds-creator/1.0",
-        "Accept": "application/json,text/plain,*/*",
-    }
+
+    def _parse_req_tokens(headers: Dict[str, str]) -> int:
+        raw = (headers.get("req-tokens") or headers.get("Req-Tokens") or "0").strip()
+        if not raw:
+            return 0
+        try:
+            return int(raw)
+        except ValueError:
+            try:
+                return int(float(raw))
+            except Exception:
+                return 0
 
     for attempt in range(1, max_tries + 1):
         r = None
         try:
-            r = requests.post(url, json=payload, headers=headers, timeout=timeout_s, allow_redirects=True)
-
+            r = requests.post(url, json=payload, timeout=timeout_s, allow_redirects=True)
             ct = (r.headers.get("content-type") or "").lower()
-            req_tokens = _parse_req_tokens(r.headers.get("req-tokens", "0"))
+            req_tokens = _parse_req_tokens(r.headers)
 
-            # Retryable statuses
+            # Retry transient status codes
             if r.status_code in (429, 500, 502, 503, 504):
-                head = (r.text or "")[:300].replace("\n", " ")
+                head = (r.text or "")[:250].replace("\n", " ")
                 last_err = f"HTTP {r.status_code} ct={ct} head={head!r}"
-                backoff = min(30.0, (2 ** (attempt - 1)) + 0.25 * attempt)
+                backoff = min(30.0, (2 ** (attempt - 1)) + (0.2 * attempt))
                 time.sleep(backoff)
                 continue
 
-            # Hard error statuses -> raise with body head (often HTML)
-            if r.status_code >= 400:
-                head = (r.text or "")[:600].replace("\n", " ")
-                raise RuntimeError(f"HTTP {r.status_code} ct={ct} head={head!r}")
+            # For non-2xx, try to extract a meaningful error without assuming JSON
+            if r.status_code < 200 or r.status_code >= 300:
+                head = (r.text or "")[:400].replace("\n", " ")
+                # If API returned JSON anyway, parse it
+                if "application/json" in ct:
+                    try:
+                        data = r.json()
+                        if isinstance(data, dict) and data.get("error"):
+                            msg = str(data["error"])
+                            # Hard-fail common config problems (no retry)
+                            if "Too many keywords" in msg or "not valid" in msg:
+                                raise RuntimeError(msg)
+                            last_err = msg
+                        else:
+                            last_err = f"HTTP {r.status_code} (json) head={head!r}"
+                    except Exception:
+                        last_err = f"HTTP {r.status_code} ct={ct} head={head!r}"
+                else:
+                    last_err = f"HTTP {r.status_code} ct={ct} head={head!r}"
 
-            # Must be JSON
-            try:
-                data = r.json()
-            except Exception:
-                head = (r.text or "")[:600].replace("\n", " ")
-                raise RuntimeError(f"Non-JSON response (status={r.status_code}, ct={ct}). head={head!r}")
+                # Hard-fail 400s (bad query) instead of retry-looping forever
+                if r.status_code == 400:
+                    raise RuntimeError(last_err)
 
-            # API-level errors (JSON)
-            if isinstance(data, dict) and data.get("error"):
-                last_err = str(data.get("error"))
-                # Some errors can be transient; retry a few times
+                # Otherwise retry a bit
                 if attempt < max_tries:
                     time.sleep(min(10.0, 1.5 * attempt))
                     continue
                 raise RuntimeError(last_err)
 
-            if sleep_s:
-                time.sleep(sleep_s)
+            # 2xx: parse JSON (or fail with a useful error)
+            if "application/json" not in ct:
+                head = (r.text or "")[:400].replace("\n", " ")
+                raise RuntimeError(f"Non-JSON success? status={r.status_code} ct={ct} head={head!r}")
 
+            data = r.json()
+            if isinstance(data, dict) and data.get("error"):
+                msg = str(data["error"])
+                # Hard-fail config errors
+                if "Too many keywords" in msg or "not valid" in msg:
+                    raise RuntimeError(msg)
+                last_err = msg
+                if attempt < max_tries:
+                    time.sleep(min(10.0, 1.5 * attempt))
+                    continue
+                raise RuntimeError(msg)
+
+            if sleep_s > 0:
+                time.sleep(sleep_s)
             return data, req_tokens
 
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            # If it was a hard error (400s, non-JSON, etc), don't hammer retries too aggressively
-            msg = str(e)
-            last_err = msg
+            if last_err is None:
+                if r is not None:
+                    ct = (r.headers.get("content-type") or "")
+                    head = (r.text or "")[:250].replace("\n", " ")
+                    last_err = f"{e} (status={r.status_code}, ct={ct}, head={head!r})"
+                else:
+                    last_err = str(e)
+
             if attempt < max_tries:
                 time.sleep(min(15.0, 1.5 * attempt))
                 continue
             raise RuntimeError(f"NewsAPI.ai request failed after retries: {last_err}") from e
 
     raise RuntimeError(f"NewsAPI.ai request failed: {last_err}")
-
-def build_complex_query_from_terms(
-    locality_terms: List[str],
-    intent_terms: List[str],
-    *,
-    negative_terms: List[str],
-    use_negatives: bool,
-    date_start: str,
-    date_end: str,
-    skip_duplicates: bool = True,
-) -> Dict[str, Any]:
-    clauses: List[Dict[str, Any]] = []
-
-    # date range as a condition
-    clauses.append({"dateStart": date_start, "dateEnd": date_end})
-
-    if locality_terms:
-        clauses.append({"keyword": {"$or": locality_terms}})
-    if intent_terms:
-        clauses.append({"keyword": {"$or": intent_terms}})
-
-    if use_negatives and negative_terms:
-        clauses.append({"$not": {"keyword": {"$or": negative_terms}}})
-
-    q = clauses[0] if len(clauses) == 1 else {"$and": clauses}
-
-    out: Dict[str, Any] = {"$query": q}
-
-    # IMPORTANT: duplicate handling belongs in $filter, not as top-level isDuplicateFilter
-    if skip_duplicates:
-        out["$filter"] = {"isDuplicate": "skipDuplicates"}  # :contentReference[oaicite:1]{index=1}
-
-    return out
-
 
 
 def cache_path(raw_dir: str, cache_key: str) -> str:
@@ -694,6 +700,11 @@ def main() -> None:
                             f"L={len(loc_shard)} I={len(intent_shard)} burn={budget.burned}/{budget.max_burn}",
                             flush=True,
                         )
+
+                        kw = len(loc_shard) + len(intent_shard) + (len(DEFAULT_NEGATIVE_TERMS) if args.use_negatives else 0)
+                        if kw > 15:
+                            raise SystemExit(f"Query would use {kw} keywords (>15 free-tier cap). Reduce shard sizes or disable negatives.")
+
 
                         q = build_complex_query_from_terms(
                             loc_shard,
