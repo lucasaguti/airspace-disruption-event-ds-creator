@@ -192,6 +192,111 @@ def _parse_req_tokens(v: Any) -> int:
         digits = "".join(ch for ch in s if ch.isdigit())
         return int(digits) if digits else 0
 
+def _newsai_suggest_locations_fast(endpoint_base: str, api_key: str, text: str) -> Optional[str]:
+    url = endpoint_base.rstrip("/") + "/api/v1/suggestLocationsFast"
+    payload = {
+        "action": "suggestLocationsFast",
+        "apiKey": api_key,
+        "prefix": text,
+        "count": 1,
+    }
+    data, _ = _newsai_post_json(url, payload, timeout_s=30, sleep_s=0.0)
+    locs = data.get("locations") or []
+    if not locs:
+        return None
+    # EventRegistry uses wikiUri for locations
+    return (locs[0].get("wikiUri") or "").strip() or None
+
+
+def _newsai_suggest_concepts_fast(endpoint_base: str, api_key: str, text: str) -> Optional[str]:
+    url = endpoint_base.rstrip("/") + "/api/v1/suggestConceptsFast"
+    payload = {
+        "action": "suggestConceptsFast",
+        "apiKey": api_key,
+        "prefix": text,
+        "count": 1,
+        "conceptLang": "eng",
+    }
+    data, _ = _newsai_post_json(url, payload, timeout_s=30, sleep_s=0.0)
+    cs = data.get("concepts") or []
+    if not cs:
+        return None
+    return (cs[0].get("uri") or "").strip() or None
+
+
+def _load_json(path: str) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _save_json_atomic(path: str, obj: Dict[str, Any]) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def resolve_location_uris(
+    terms: List[str],
+    *,
+    endpoint_base: str,
+    api_key: str,
+    cache_path: str,
+) -> List[str]:
+    cache = _load_json(cache_path)
+    out: List[str] = []
+    for t in terms:
+        k = f"loc::{t}".lower()
+        if k in cache:
+            if cache[k]:
+                out.append(cache[k])
+            continue
+        uri = _newsai_suggest_locations_fast(endpoint_base, api_key, t)
+        cache[k] = uri
+        if uri:
+            out.append(uri)
+    _save_json_atomic(cache_path, cache)
+    # unique preserve order
+    seen = set()
+    uniq = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
+def resolve_concept_uris(
+    terms: List[str],
+    *,
+    endpoint_base: str,
+    api_key: str,
+    cache_path: str,
+) -> List[str]:
+    cache = _load_json(cache_path)
+    out: List[str] = []
+    for t in terms:
+        k = f"con::{t}".lower()
+        if k in cache:
+            if cache[k]:
+                out.append(cache[k])
+            continue
+        uri = _newsai_suggest_concepts_fast(endpoint_base, api_key, t)
+        cache[k] = uri
+        if uri:
+            out.append(uri)
+    _save_json_atomic(cache_path, cache)
+    seen = set()
+    uniq = []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
 def _newsai_post_json(
     url: str,
     payload: Dict[str, Any],
@@ -201,108 +306,70 @@ def _newsai_post_json(
     max_tries: int = 6,
 ) -> Tuple[Dict[str, Any], int]:
     """
-    POST JSON to NewsAPI.ai (Event Registry). Returns (data, req_tokens).
-    Robust to:
-      - HTML error bodies
-      - JSON bodies with {"error": "..."}
-      - req-tokens header formatted as '1.000'
-      - transient 429/5xx retry with backoff
+    POST JSON to NewsAPI.ai/EventRegistry; returns (data, req_tokens_int).
+    - Handles HTML/non-JSON responses cleanly
+    - Parses req-tokens header robustly (can be '1.000')
+    - Retries transient failures with backoff
     """
     last_err: Optional[str] = None
-
-    def _parse_req_tokens(headers: Dict[str, str]) -> int:
-        raw = (headers.get("req-tokens") or headers.get("Req-Tokens") or "0").strip()
-        if not raw:
-            return 0
-        try:
-            return int(raw)
-        except ValueError:
-            try:
-                return int(float(raw))
-            except Exception:
-                return 0
+    last_status: Optional[int] = None
+    last_ct: str = ""
+    last_head: str = ""
 
     for attempt in range(1, max_tries + 1):
         r = None
         try:
             r = requests.post(url, json=payload, timeout=timeout_s, allow_redirects=True)
-            ct = (r.headers.get("content-type") or "").lower()
-            req_tokens = _parse_req_tokens(r.headers)
 
-            # Retry transient status codes
+            last_status = r.status_code
+            last_ct = (r.headers.get("content-type") or "").lower()
+            last_head = (r.text or "")[:400].replace("\n", " ").strip()
+
+            # req-tokens can be missing, int-like, or float-like ("1.000")
+            rt = r.headers.get("req-tokens", "") or ""
+            try:
+                req_tokens = int(float(rt)) if rt.strip() else 0
+            except Exception:
+                req_tokens = 0
+
+            # Transient HTTP statuses
             if r.status_code in (429, 500, 502, 503, 504):
-                head = (r.text or "")[:250].replace("\n", " ")
-                last_err = f"HTTP {r.status_code} ct={ct} head={head!r}"
-                backoff = min(30.0, (2 ** (attempt - 1)) + (0.2 * attempt))
+                last_err = f"HTTP {r.status_code} ct={last_ct} head={last_head!r}"
+                backoff = min(30.0, (2 ** (attempt - 1)) + (0.25 * attempt))
                 time.sleep(backoff)
                 continue
 
-            # For non-2xx, try to extract a meaningful error without assuming JSON
-            if r.status_code < 200 or r.status_code >= 300:
-                head = (r.text or "")[:400].replace("\n", " ")
-                # If API returned JSON anyway, parse it
-                if "application/json" in ct:
-                    try:
-                        data = r.json()
-                        if isinstance(data, dict) and data.get("error"):
-                            msg = str(data["error"])
-                            # Hard-fail common config problems (no retry)
-                            if "Too many keywords" in msg or "not valid" in msg:
-                                raise RuntimeError(msg)
-                            last_err = msg
-                        else:
-                            last_err = f"HTTP {r.status_code} (json) head={head!r}"
-                    except Exception:
-                        last_err = f"HTTP {r.status_code} ct={ct} head={head!r}"
-                else:
-                    last_err = f"HTTP {r.status_code} ct={ct} head={head!r}"
+            # Hard HTTP errors: raise with helpful info
+            if r.status_code >= 400:
+                raise RuntimeError(f"HTTP {r.status_code} ct={last_ct} head={last_head!r}")
 
-                # Hard-fail 400s (bad query) instead of retry-looping forever
-                if r.status_code == 400:
-                    raise RuntimeError(last_err)
+            # Must be JSON
+            try:
+                data = r.json()
+            except Exception:
+                raise RuntimeError(f"Non-JSON response (status={r.status_code}, ct={last_ct}) head={last_head!r}")
 
-                # Otherwise retry a bit
-                if attempt < max_tries:
-                    time.sleep(min(10.0, 1.5 * attempt))
-                    continue
-                raise RuntimeError(last_err)
-
-            # 2xx: parse JSON (or fail with a useful error)
-            if "application/json" not in ct:
-                head = (r.text or "")[:400].replace("\n", " ")
-                raise RuntimeError(f"Non-JSON success? status={r.status_code} ct={ct} head={head!r}")
-
-            data = r.json()
+            # EventRegistry returns {"error": "..."} with 200 sometimes
             if isinstance(data, dict) and data.get("error"):
-                msg = str(data["error"])
-                # Hard-fail config errors
-                if "Too many keywords" in msg or "not valid" in msg:
-                    raise RuntimeError(msg)
-                last_err = msg
-                if attempt < max_tries:
-                    time.sleep(min(10.0, 1.5 * attempt))
-                    continue
+                msg = str(data.get("error"))
                 raise RuntimeError(msg)
 
             if sleep_s > 0:
                 time.sleep(sleep_s)
+
             return data, req_tokens
 
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            if last_err is None:
-                if r is not None:
-                    ct = (r.headers.get("content-type") or "")
-                    head = (r.text or "")[:250].replace("\n", " ")
-                    last_err = f"{e} (status={r.status_code}, ct={ct}, head={head!r})"
-                else:
-                    last_err = str(e)
-
+            last_err = str(e)
             if attempt < max_tries:
                 time.sleep(min(15.0, 1.5 * attempt))
                 continue
-            raise RuntimeError(f"NewsAPI.ai request failed after retries: {last_err}") from e
+            raise RuntimeError(
+                f"NewsAPI.ai request failed after retries: {last_err} "
+                f"(status={last_status}, ct={last_ct}, head={last_head!r})"
+            ) from e
 
     raise RuntimeError(f"NewsAPI.ai request failed: {last_err}")
 
@@ -613,41 +680,43 @@ def build_complex_query_from_terms(
     locality_terms: List[str],
     intent_terms: List[str],
     *,
-    negative_terms: List[str],
-    use_negatives: bool,
+    endpoint_base: str,
+    api_key: str,
+    uri_cache_path: str,
     date_start: str,
     date_end: str,
 ) -> Dict[str, Any]:
-    """
-    Build an Event Registry advanced query JSON.
-    Uses:
-      - dateStart/dateEnd
-      - keyword OR locality terms
-      - keyword OR intent terms
-      - optional NOT keyword OR negative terms
+    loc_uris = resolve_location_uris(
+        locality_terms,
+        endpoint_base=endpoint_base,
+        api_key=api_key,
+        cache_path=uri_cache_path,
+    )
+    intent_uris = resolve_concept_uris(
+        intent_terms,
+        endpoint_base=endpoint_base,
+        api_key=api_key,
+        cache_path=uri_cache_path,
+    )
 
-    Free plan note: keyword limits apply across these lists.
-    """
-    clauses: List[Dict[str, Any]] = []
+    q: Dict[str, Any] = {
+        "$query": {
+            "dateStart": date_start,
+            "dateEnd": date_end,
+        },
+        "$filter": {
+            "isDuplicate": "skipDuplicates",
+        },
+    }
 
-    # Date clause
-    clauses.append({"dateStart": date_start, "dateEnd": date_end})
+    # These do NOT count as "keywords" in the free-plan sense
+    if loc_uris:
+        q["$query"]["locationUri"] = {"$or": loc_uris}
+    if intent_uris:
+        q["$query"]["conceptUri"] = {"$or": intent_uris}
 
-    if locality_terms:
-        clauses.append({"keyword": {"$or": locality_terms}})
+    return q
 
-    if intent_terms:
-        clauses.append({"keyword": {"$or": intent_terms}})
-
-    if use_negatives and negative_terms:
-        clauses.append({"$not": {"keyword": {"$or": negative_terms}}})
-
-    if len(clauses) == 1:
-        q = clauses[0]
-    else:
-        q = {"$and": clauses}
-
-    return {"$query": q}
 
 
 # ---------------------------
@@ -747,14 +816,20 @@ def main() -> None:
                             raise SystemExit(f"Query would use {kw} keywords (>15 free-tier cap). Reduce shard sizes or disable negatives.")
 
 
+                        endpoint_base = _newsai_base()
+                        api_key = _newsai_token()
+                        uri_cache_path = os.path.join(args.raw_dir, "_uri_cache.json")
+                        
                         q = build_complex_query_from_terms(
                             loc_shard,
                             intent_shard,
-                            negative_terms=DEFAULT_NEGATIVE_TERMS,
-                            use_negatives=bool(args.use_negatives),
+                            endpoint_base=endpoint_base,
+                            api_key=api_key,
+                            uri_cache_path=uri_cache_path,
                             date_start=date_start,
                             date_end=date_end,
                         )
+
 
                         # Cache directory is per box/bundle/date shard so resumes don't waste credits
                         shard_dir = os.path.join(args.raw_dir, f"box={box_id}", f"bundle={bundle}", f"{date_start}_{date_end}", f"loc{li}_intent{ii}")
