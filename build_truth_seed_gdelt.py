@@ -216,7 +216,7 @@ def _request_json_with_retries(
                 GDELT_DOC_ENDPOINT,
                 params=params,
                 headers=DEFAULT_HEADERS,
-                timeout=60,
+                timeout=(10, 25),  # (connect, read) seconds
             )
             last_status = r.status_code
             last_url = r.url
@@ -798,6 +798,18 @@ def main():
     ap.add_argument("--sleep", type=float, default=1.2, help="Sleep seconds between API calls (increase if 429).")
     ap.add_argument("--max-pages", type=int, default=120, help="Max paging iterations per chunk (reduce if throttled).")
 
+    ap.add_argument(
+    "--loc-shard-size",
+    type=int,
+    default=4,
+    help="Shard locality terms into groups of this size (no terms dropped; avoids 'query too long').",
+    )
+    ap.add_argument(
+        "--use-negatives",
+        action="store_true",
+        help="Include query-level negative terms (adds length; can trigger GDELT syntax limits). Default: off.",
+    )
+
     ap.add_argument("--min-total-articles", type=int, default=3, help="Ranking threshold (broad).")
     ap.add_argument("--min-unique-domains", type=int, default=1, help="Ranking threshold (broad).")
     ap.add_argument("--top-k-per-box", type=int, default=500, help="Keep top-K aggregates per box for clustering.")
@@ -833,6 +845,8 @@ def main():
     for box_id, locality_terms in watchbox_terms.items():
         if not locality_terms:
             continue
+
+        loc_shards = chunk_list(locality_terms, args.loc_shard_size)
           
         box_docs_parts = []
         for bundle in bundles_to_run:
@@ -844,23 +858,28 @@ def main():
                 intent_terms = list(DEFAULT_INTENT_BUNDLES[bundle])
         
             for (rs, re_) in ranges:
-                print(f"[fetch] box={box_id} bundle={bundle} range={rs.date()}..{re_.date()}", flush=True)
-                arts = fetch_with_sharding(
-                    locality_terms=locality_terms,
-                    intent_terms=intent_terms,
-                    negative_terms=DEFAULT_NEGATIVE_TERMS,
-                    start_dt=rs,
-                    end_dt=re_,
-                    maxrecords=args.maxrecords,
-                    sleep_s=args.sleep,
-                    max_pages=args.max_pages,
-                )
-                df_part = articles_to_frame(arts, box_id=box_id)
-                if df_part.empty:
-                    continue
-                if not df_part.empty:
+                for loc_shard in loc_shards:
+                    print(
+                        f"[fetch] box={box_id} bundle={bundle} range={rs.date()}..{re_.date()} "
+                        f"loc_shard={len(loc_shard)}",
+                        flush=True,
+                    )
+                    arts = fetch_with_sharding(
+                        locality_terms=loc_shard,
+                        intent_terms=intent_terms,
+                        negative_terms=(DEFAULT_NEGATIVE_TERMS if args.use_negatives else []),
+                        start_dt=rs,
+                        end_dt=re_,
+                        maxrecords=args.maxrecords,
+                        sleep_s=args.sleep,
+                        max_pages=args.max_pages,
+                    )
+                    df_part = articles_to_frame(arts, box_id=box_id)
+                    if df_part.empty:
+                        continue
                     df_part["intent_bundle"] = bundle
-                box_docs_parts.append(df_part)  
+                    box_docs_parts.append(df_part)
+  
 
         if box_docs_parts:
             df_box = pd.concat(box_docs_parts, ignore_index=True)
