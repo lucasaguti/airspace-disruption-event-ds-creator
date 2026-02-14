@@ -609,6 +609,47 @@ def verify_events_against_counts(
         })
     return pd.DataFrame(rows)
 
+def build_complex_query_from_terms(
+    locality_terms: List[str],
+    intent_terms: List[str],
+    *,
+    negative_terms: List[str],
+    use_negatives: bool,
+    date_start: str,
+    date_end: str,
+) -> Dict[str, Any]:
+    """
+    Build an Event Registry advanced query JSON.
+    Uses:
+      - dateStart/dateEnd
+      - keyword OR locality terms
+      - keyword OR intent terms
+      - optional NOT keyword OR negative terms
+
+    Free plan note: keyword limits apply across these lists.
+    """
+    clauses: List[Dict[str, Any]] = []
+
+    # Date clause
+    clauses.append({"dateStart": date_start, "dateEnd": date_end})
+
+    if locality_terms:
+        clauses.append({"keyword": {"$or": locality_terms}})
+
+    if intent_terms:
+        clauses.append({"keyword": {"$or": intent_terms}})
+
+    if use_negatives and negative_terms:
+        clauses.append({"$not": {"keyword": {"$or": negative_terms}}})
+
+    if len(clauses) == 1:
+        q = clauses[0]
+    else:
+        q = {"$and": clauses}
+
+    return {"$query": q}
+
+
 # ---------------------------
 # Main
 # ---------------------------
