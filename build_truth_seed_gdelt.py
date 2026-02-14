@@ -159,30 +159,34 @@ def build_query_from_terms(
     negative_terms: List[str],
 ) -> str:
     """
-    Broad query:
-      (locality OR ...) (intent OR ...)  -neg1 -neg2 -"..."
-    IMPORTANT: GDELT does NOT permit negation of OR clauses like: -(a OR b).
-    Use individual negations instead.
+    GDELT rules:
+      - Parentheses may only be used around OR'd statements.
+      - Negation of OR clauses is not permitted (so use -term -term ...).
     """
     def qterm(x: str) -> str:
         x = (x or "").strip()
         if not x:
             return ""
-        if " " in x:
-            return f'"{x}"'
-        return x
+        return f'"{x}"' if " " in x else x
 
     loc_terms = [t for t in locality_terms if (t or "").strip()]
-    intents_flat = [t for t in intent_terms if (t or "").strip()]
+    int_terms = [t for t in intent_terms if (t or "").strip()]
     neg_terms = [t for t in negative_terms if (t or "").strip()]
 
-    loc = " OR ".join(qterm(t) for t in loc_terms)
-    intent = " OR ".join(qterm(t) for t in intents_flat)
+    loc = " OR ".join(qterm(t) for t in loc_terms if qterm(t))
+    intent = " OR ".join(qterm(t) for t in int_terms if qterm(t))
+
+    if not loc or not intent:
+        raise ValueError("Empty locality or intent terms after cleaning.")
+
+    # Only wrap in parentheses if there is an OR (GDELT rule)
+    loc_expr = f"({loc})" if " OR " in loc else loc
+    intent_expr = f"({intent})" if " OR " in intent else intent
 
     # Individual negations (no -(a OR b))
     neg_clause = " ".join(f"-{qterm(t)}" for t in neg_terms if qterm(t))
 
-    q = f"({loc}) ({intent})"
+    q = f"{loc_expr} {intent_expr}"
     if neg_clause:
         q = f"{q} {neg_clause}"
     return q.strip()
