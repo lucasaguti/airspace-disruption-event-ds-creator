@@ -221,6 +221,18 @@ def _request_json_with_retries(
                 headers=DEFAULT_HEADERS,
                 timeout=(10, 25),  # (connect, read) seconds
             )
+            if r.status_code == 429:
+                # GDELT often returns plain text for 429
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    wait = float(retry_after)
+                else:
+                    # GDELT guidance is ~1 request / 5 seconds
+                    wait = max(5.0, sleep_s)
+            
+                print(f"[rate-limit] 429; sleeping {wait:.1f}s", flush=True)
+                time.sleep(wait)
+                continue
             last_status = r.status_code
             last_url = r.url
             text = r.text or ""
