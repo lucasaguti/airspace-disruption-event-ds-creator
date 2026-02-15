@@ -195,8 +195,12 @@ def _sql_with_partitiontime(table: str) -> str:
     WHERE
       REGEXP_CONTAINS(LOWER(COALESCE(locations,'')), @loc_re)
       AND (
-        REGEXP_CONTAINS(LOWER(COALESCE(page_title,'')), @intent_re)
-        OR REGEXP_CONTAINS(COALESCE(themes,''), @theme_re)
+        (@require_title_intent AND REGEXP_CONTAINS(LOWER(COALESCE(page_title, '')), @intent_re))
+        OR
+        (NOT @require_title_intent AND (
+          REGEXP_CONTAINS(LOWER(COALESCE(page_title, '')), @intent_re)
+          OR REGEXP_CONTAINS(COALESCE(themes, ''), @theme_re)
+        ))
       )
     """
 
@@ -225,8 +229,12 @@ def _sql_without_partitiontime(table: str) -> str:
       AND d < @date_end
       AND REGEXP_CONTAINS(LOWER(COALESCE(locations,'')), @loc_re)
       AND (
-        REGEXP_CONTAINS(LOWER(COALESCE(page_title,'')), @intent_re)
-        OR REGEXP_CONTAINS(COALESCE(themes,''), @theme_re)
+        (@require_title_intent AND REGEXP_CONTAINS(LOWER(COALESCE(page_title, '')), @intent_re))
+        OR
+        (NOT @require_title_intent AND (
+          REGEXP_CONTAINS(LOWER(COALESCE(page_title, '')), @intent_re)
+          OR REGEXP_CONTAINS(COALESCE(themes, ''), @theme_re)
+        ))
       )
     """
 
@@ -242,6 +250,7 @@ def fetch_gdelt_bq_articles(
     raw_dir: str,
     resume: bool,
     theme_regex: str,
+    require_title_intent: bool = False,
     max_rows: Optional[int] = None,
     dry_run: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
@@ -259,6 +268,7 @@ def fetch_gdelt_bq_articles(
         "loc_re": loc_re,
         "intent_re": intent_re,
         "theme_re": theme_regex,
+        "require_title_intent": bool(require_title_intent),
         "max_rows": max_rows,
         "dry_run": dry_run,
     }
@@ -280,6 +290,7 @@ def fetch_gdelt_bq_articles(
                 bigquery.ScalarQueryParameter("loc_re", "STRING", loc_re),
                 bigquery.ScalarQueryParameter("intent_re", "STRING", intent_re),
                 bigquery.ScalarQueryParameter("theme_re", "STRING", theme_regex),
+                bigquery.ScalarQueryParameter("require_title_intent", "BOOL", bool(require_title_intent)),
             ],
             use_query_cache=True,
             dry_run=bool(dry_run),
@@ -528,6 +539,12 @@ def main() -> None:
     ap.add_argument("--chunk-days", type=int, default=30, help="Date chunk size (default 30).")
     ap.add_argument("--theme-regex", default=DEFAULT_THEME_REGEX, help="Regex for aviation/ops-ish themes (broad filter).")
 
+    ap.add_argument(
+        "--require-title-intent",
+        action="store_true",
+        help="Only keep docs whose PAGE_TITLE matches intent terms (disables theme-only matches).",
+    )
+
     ap.add_argument("--resume", action="store_true", help="Reuse cached shard results (prevents re-querying BigQuery).")
     ap.add_argument("--save-raw", action="store_true", help="Save per-shard caches and per-box docs CSV.")
     ap.add_argument("--raw-dir", default="raw_bq", help="Directory to store shard caches and raw docs.")
@@ -617,6 +634,7 @@ def main() -> None:
                             raw_dir=shard_dir if args.save_raw else os.path.join(args.raw_dir, "_cache"),
                             resume=bool(args.resume),
                             theme_regex=str(args.theme_regex),
+                            require_title_intent=bool(args.require_title_intent),
                             max_rows=max_rows,
                             dry_run=bool(args.dry_run),
                         )
