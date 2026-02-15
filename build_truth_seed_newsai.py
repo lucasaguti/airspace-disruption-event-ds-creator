@@ -192,16 +192,9 @@ def _parse_req_tokens(v: Any) -> int:
         digits = "".join(ch for ch in s if ch.isdigit())
         return int(digits) if digits else 0
 
-def _newsai_suggest_concepts_fast(
-    endpoint_base: str,
-    api_key: str,
-    text: str,
-    *,
-    lang: str = "eng",
-    concept_lang: str = "eng",
-) -> Optional[str]:
+def _newsai_suggest_concepts_fast(endpoint_base: str, api_key: str, text: str, *, lang: str = "eng") -> Optional[str]:
     """
-    Resolve a free-text phrase to an Event Registry concept URI using suggestConceptsFast.
+    Resolve a free-text intent string to an Event Registry concept URI using suggestConceptsFast.
 
     Robust to API returning either:
       - {"concepts": [...]}  (dict wrapper)
@@ -210,65 +203,32 @@ def _newsai_suggest_concepts_fast(
     base = (endpoint_base or "").rstrip("/")
     url = f"{base}/api/v1/suggestConceptsFast"
 
-    # IMPORTANT: don't include "action" here; REST endpoint doesn't need it
     payload = {
         "apiKey": api_key,
         "prefix": text,
         "count": 1,
-        "lang": lang,              # REQUIRED
-        "conceptLang": concept_lang,
+        "lang": lang,
+        "conceptLang": lang,
     }
 
     data, _ = _newsai_post_json(url, payload, timeout_s=30, sleep_s=0.0)
 
-    if isinstance(data, list):
-        concepts = data
-    elif isinstance(data, dict):
-        concepts = data.get("concepts") or data.get("results") or []
-    else:
-        concepts = []
-
-    for c in concepts:
-        if not isinstance(c, dict):
-            continue
-        uri = c.get("uri") or c.get("conceptUri") or c.get("wikiUri")
-        if uri:
-            return str(uri).strip()
-
-    return None
-
-
-def _newsai_suggest_concepts_fast(endpoint_base: str, api_key: str, text: str) -> Optional[str]:
-    url = endpoint_base.rstrip("/") + "/api/v1/suggestConceptsFast"
-    payload = {
-        "action": "suggestConceptsFast",
-        "apiKey": api_key,
-        "prefix": text,
-        "count": 1,
-        "lang": "eng",        # REQUIRED
-        "conceptLang": "eng", # keep (fine)
-    }
-    data, _ = _newsai_post_json(url, payload, timeout_s=30, sleep_s=0.0)
-
-    # API sometimes returns list, sometimes dict wrapper
     if isinstance(data, list):
         cs = data
     elif isinstance(data, dict):
         cs = data.get("concepts") or data.get("results") or []
     else:
         cs = []
-    
-    if not cs:
-        return None
-    
+
     for c in cs:
         if not isinstance(c, dict):
             continue
         uri = c.get("uri") or c.get("conceptUri") or c.get("wikiUri")
         if uri:
             return str(uri).strip()
-    
+
     return None
+
 
 
 def _load_json(path: str) -> Dict[str, Any]:
