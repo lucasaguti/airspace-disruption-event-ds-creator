@@ -192,45 +192,50 @@ def _parse_req_tokens(v: Any) -> int:
         digits = "".join(ch for ch in s if ch.isdigit())
         return int(digits) if digits else 0
 
-def _newsai_suggest_locations_fast(endpoint_base: str, api_key: str, text: str, *, lang: str = "eng") -> str:
+def _newsai_suggest_concepts_fast(
+    endpoint_base: str,
+    api_key: str,
+    text: str,
+    *,
+    lang: str = "eng",
+    concept_lang: str = "eng",
+) -> Optional[str]:
     """
-    Resolve a free-text place string to an Event Registry location URI using suggestLocationsFast.
+    Resolve a free-text phrase to an Event Registry concept URI using suggestConceptsFast.
 
-    Returns:
-      - location uri string (best guess) or "" if not found.
     Robust to API returning either:
-      - {"locations": [...]}  (dict wrapper)
-      - [...]                (top-level list)
+      - {"concepts": [...]}  (dict wrapper)
+      - [...]               (top-level list)
     """
     base = (endpoint_base or "").rstrip("/")
-    url = f"{base}/api/v1/suggestLocationsFast"
+    url = f"{base}/api/v1/suggestConceptsFast"
 
+    # IMPORTANT: don't include "action" here; REST endpoint doesn't need it
     payload = {
         "apiKey": api_key,
         "prefix": text,
-        "lang": lang,          # REQUIRED by API (your error)
-        "count": 1,            # we only need the best match
+        "count": 1,
+        "lang": lang,              # REQUIRED
+        "conceptLang": concept_lang,
     }
 
     data, _ = _newsai_post_json(url, payload, timeout_s=30, sleep_s=0.0)
 
-    # API sometimes returns list, sometimes dict wrapper
     if isinstance(data, list):
-        locs = data
+        concepts = data
     elif isinstance(data, dict):
-        locs = data.get("locations") or data.get("results") or []
+        concepts = data.get("concepts") or data.get("results") or []
     else:
-        locs = []
+        concepts = []
 
-    for loc in locs:
-        if not isinstance(loc, dict):
+    for c in concepts:
+        if not isinstance(c, dict):
             continue
-        uri = loc.get("uri") or loc.get("wikiUri") or loc.get("conceptUri")
+        uri = c.get("uri") or c.get("conceptUri") or c.get("wikiUri")
         if uri:
-            return str(uri)
+            return str(uri).strip()
 
-    return ""
-
+    return None
 
 
 def _newsai_suggest_concepts_fast(endpoint_base: str, api_key: str, text: str) -> Optional[str]:
@@ -329,7 +334,7 @@ def _newsai_post_json(
     timeout_s: int = 60,
     sleep_s: float = 0.0,
     max_tries: int = 6,
-) -> Tuple[Dict[str, Any], int]:
+) -> Tuple[Any, int]:
     """
     POST JSON to NewsAPI.ai/EventRegistry; returns (data, req_tokens_int).
     - Handles HTML/non-JSON responses cleanly
