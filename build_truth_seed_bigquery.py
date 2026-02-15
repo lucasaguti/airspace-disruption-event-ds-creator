@@ -148,11 +148,16 @@ def select_intent_bundles(mode: str) -> Dict[str, List[str]]:
 
 
 def _re_union(terms: List[str]) -> str:
-    """Build RE2-safe case-insensitive union regex."""
     clean = [t.strip().lower() for t in terms if (t or "").strip()]
     if not clean:
         return r"(?i)$^"  # match nothing
-    parts = [re.escape(t) for t in clean]
+
+    parts = []
+    for t in clean:
+        esc = re.escape(t)
+        # require "term" to appear as its own token-ish unit in the locations string
+        parts.append(rf"(?:^|[^a-z0-9]){esc}(?:[^a-z0-9]|$)")
+
     return r"(?i)(" + "|".join(parts) + r")"
 
 
