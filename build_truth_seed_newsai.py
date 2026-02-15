@@ -192,20 +192,45 @@ def _parse_req_tokens(v: Any) -> int:
         digits = "".join(ch for ch in s if ch.isdigit())
         return int(digits) if digits else 0
 
-def _newsai_suggest_locations_fast(endpoint_base: str, api_key: str, text: str) -> Optional[str]:
-    url = endpoint_base.rstrip("/") + "/api/v1/suggestLocationsFast"
+def _newsai_suggest_locations_fast(endpoint_base: str, api_key: str, text: str, *, lang: str = "eng") -> str:
+    """
+    Resolve a free-text place string to an Event Registry location URI using suggestLocationsFast.
+
+    Returns:
+      - location uri string (best guess) or "" if not found.
+    Robust to API returning either:
+      - {"locations": [...]}  (dict wrapper)
+      - [...]                (top-level list)
+    """
+    base = (endpoint_base or "").rstrip("/")
+    url = f"{base}/api/v1/suggestLocationsFast"
+
     payload = {
-        "action": "suggestLocationsFast",
         "apiKey": api_key,
         "prefix": text,
-        "count": 1,
-        "lang": "eng",  # REQUIRED
+        "lang": lang,          # REQUIRED by API (your error)
+        "count": 1,            # we only need the best match
     }
+
     data, _ = _newsai_post_json(url, payload, timeout_s=30, sleep_s=0.0)
-    locs = data.get("locations") or []
-    if not locs:
-        return None
-    return (locs[0].get("wikiUri") or "").strip() or None
+
+    # API sometimes returns list, sometimes dict wrapper
+    if isinstance(data, list):
+        locs = data
+    elif isinstance(data, dict):
+        locs = data.get("locations") or data.get("results") or []
+    else:
+        locs = []
+
+    for loc in locs:
+        if not isinstance(loc, dict):
+            continue
+        uri = loc.get("uri") or loc.get("wikiUri") or loc.get("conceptUri")
+        if uri:
+            return str(uri)
+
+    return ""
+
 
 
 def _newsai_suggest_concepts_fast(endpoint_base: str, api_key: str, text: str) -> Optional[str]:
@@ -327,10 +352,15 @@ def _newsai_post_json(
 
             # req-tokens can be missing, int-like, or float-like ("1.000")
             rt = r.headers.get("req-tokens", "") or ""
+            _raw = (r.headers.get("req-tokens") or "0").strip()
             try:
-                req_tokens = int(float(rt)) if rt.strip() else 0
-            except Exception:
-                req_tokens = 0
+                req_tokens = int(_raw)
+            except ValueError:
+                try:
+                    req_tokens = int(float(_raw))
+                except ValueError:
+                    req_tokens = 0
+
 
             # Transient HTTP statuses
             if r.status_code in (429, 500, 502, 503, 504):
