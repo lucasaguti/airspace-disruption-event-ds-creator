@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Build event-first seed dataset using GDELT BigQuery (GKG) and verify against corridor counts.
+Build NEWS-ONLY (reported) event-first seed dataset using GDELT BigQuery (GKG).
 
 Design goals:
   - Fast, scalable historical capture using BigQuery (no API paging bottlenecks)
   - Broad capture (location + intent/title/themes), then reuse your existing pipeline:
-      articles_to_frame → make_aggregates → cluster_candidates → verify_events_against_counts
+      articles_to_frame → make_aggregates → select_seed_candidates → cluster_candidates → attach_top_sources
   - Resume-safe: every (box × date-chunk × loc-shard × intent-shard) query is cached to disk.
     Reruns do NOT re-query BigQuery when --resume is enabled.
 
@@ -23,7 +23,7 @@ Inputs:
 Outputs:
   - Raw cache per shard: <raw-dir>/.../bq_<hash>.csv.gz
   - Optional per-box docs CSV: <raw-dir>/docs_<box>_<start>_<end>.csv
-  - Final CSV: --out-csv (same schema as your other truth seed builders)
+  - Final CSV: --out-csv (NEWS-ONLY seed clusters; counts fields left blank)
 
 Notes:
   - GKG doesn't reliably provide language per row; we leave language blank.
@@ -369,7 +369,7 @@ def make_aggregates(df_docs: pd.DataFrame, bucket_hours: int = 24) -> pd.DataFra
     ts = pd.to_datetime(df["published_utc"], errors="coerce", utc=True)
     df = df[ts.notna()].copy()
     df["ts_utc"] = ts[ts.notna()]
-    df["bucket_utc"] = df["ts_utc"].dt.floor(f"{bucket_hours}H")
+    df["bucket_utc"] = df["ts_utc"].dt.floor(f"{bucket_hours}h")
     agg = (
         df.groupby(["box_id", "bucket_utc"])
           .agg(
@@ -462,67 +462,46 @@ def attach_top_sources(events: List[Dict[str, Any]], df_docs: pd.DataFrame, top_
     return events
 
 
-def load_counts(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, compression="infer")
-    df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
-    df = df[df["ts_utc"].notna()].copy()
-    return df
+def events_to_news_seed_frame(events: List[Dict[str, Any]], bucket_hours: int) -> pd.DataFrame:
+    """
+    NEWS-ONLY output. Keeps columns compatible with the "truth seed" schema by leaving
+    counts-derived fields blank/NA. This lets you add counts in phase 2 without
+    breaking downstream consumers expecting these columns to exist.
+    """
+    rows: List[Dict[str, Any]] = []
+    pad = pd.Timedelta(hours=int(bucket_hours))
 
-
-def compute_baseline_window(df_counts: pd.DataFrame, box_id: str, center: pd.Timestamp, hours_before: int = 72) -> float:
-    start = center - pd.Timedelta(hours=hours_before)
-    sub = df_counts[(df_counts["box_id"] == box_id) & (df_counts["ts_utc"] >= start) & (df_counts["ts_utc"] < center)]
-    if sub.empty:
-        return float("nan")
-    return float(sub["count"].median())
-
-
-def compute_extremum_window(df_counts: pd.DataFrame, box_id: str, start: pd.Timestamp, end: pd.Timestamp) -> float:
-    sub = df_counts[(df_counts["box_id"] == box_id) & (df_counts["ts_utc"] >= start) & (df_counts["ts_utc"] <= end)]
-    if sub.empty:
-        return float("nan")
-    return float(sub["count"].min())
-
-
-def verify_events_against_counts(
-    events: List[Dict[str, Any]],
-    counts_df: pd.DataFrame,
-    window_pad_hours: int,
-    min_baseline: float,
-    shock_thresh: float,
-) -> pd.DataFrame:
-    rows = []
     for e in events:
-        box = e["box_id"]
         start = pd.to_datetime(e["event_start_utc"], utc=True)
-        end = pd.to_datetime(e["event_end_utc"], utc=True) + pd.Timedelta(hours=window_pad_hours)
-        baseline = compute_baseline_window(counts_df, box, start, hours_before=72)
-        extremum = compute_extremum_window(counts_df, box, start, end)
-        if math.isnan(baseline) or math.isnan(extremum) or baseline <= 0:
-            continue
-        delta_pct = (extremum - baseline) / baseline
-        direction = "DOWN" if delta_pct < 0 else "UP"
-        impact_pass = (baseline >= min_baseline) and (abs(delta_pct) >= shock_thresh)
-        rows.append({
-            "event_id": e["event_id"],
-            "box_id": box,
-            "event_start_utc": start.isoformat(),
-            "event_end_utc": end.isoformat(),
-            "rep_title": e.get("rep_title", ""),
-            "total_articles": e.get("total_articles", 0),
-            "unique_domains": e.get("unique_domains", 0),
-            "unique_languages": e.get("unique_languages", 0),
-            "baseline": baseline,
-            "extremum": extremum,
-            "delta_pct_peak": delta_pct,
-            "direction": direction,
-            "duration_min": int((end - start).total_seconds() // 60),
-            "impact_pass": bool(impact_pass),
-            "top_domains": e.get("top_domains", "[]"),
-            "top_urls": e.get("top_urls", "[]"),
-            "fin_label": "",
-            "notes": "",
-        })
+        # In clustering, event_end_utc is the last bucket timestamp; make end exclusive by adding bucket_hours.
+        end_excl = pd.to_datetime(e["event_end_utc"], utc=True) + pad
+
+        rows.append(
+            {
+                "event_id": e.get("event_id", ""),
+                "box_id": e.get("box_id", ""),
+                "event_start_utc": start.isoformat(),
+                "event_end_utc": end_excl.isoformat(),
+                "rep_title": e.get("rep_title", ""),
+                "total_articles": int(e.get("total_articles", 0) or 0),
+                "unique_domains": int(e.get("unique_domains", 0) or 0),
+                "unique_languages": int(e.get("unique_languages", 0) or 0),
+
+                # Counts-derived fields intentionally blank (Phase 2)
+                "baseline": float("nan"),
+                "extremum": float("nan"),
+                "delta_pct_peak": float("nan"),
+                "direction": "",
+                "duration_min": int((end_excl - start).total_seconds() // 60),
+                "impact_pass": "",
+
+                "top_domains": e.get("top_domains", "[]"),
+                "top_urls": e.get("top_urls", "[]"),
+                "fin_label": "",
+                "notes": "",
+            }
+        )
+
     return pd.DataFrame(rows)
 
 
@@ -531,13 +510,12 @@ def verify_events_against_counts(
 # ---------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build event-first seed dataset from GDELT BigQuery (GKG) and verify against corridor counts.")
+    ap = argparse.ArgumentParser(description="Build NEWS-ONLY seed dataset from GDELT BigQuery (GKG).")
     ap.add_argument("--gcp-project", required=True, help="GCP project ID used for BigQuery billing/auth.")
     ap.add_argument("--gdelt-table", default=DEFAULT_GDELT_TABLE, help=f"BigQuery table (default: {DEFAULT_GDELT_TABLE})")
 
     ap.add_argument("--watchbox-terms", required=True, help="JSON file mapping box_id -> locality_terms[]")
-    ap.add_argument("--counts-path", required=True, help="Counts file with ts_utc, box_id, count (optional __global__).")
-    ap.add_argument("--out-csv", default="truth_seed_v1.csv", help="Output CSV path.")
+    ap.add_argument("--out-csv", default="news_seed_v1.csv", help="Output CSV path.")
     ap.add_argument("--start-date", required=True, help="UTC start date YYYY-MM-DD (inclusive).")
     ap.add_argument("--end-date", required=True, help="UTC end date YYYY-MM-DD (exclusive).")
 
@@ -672,7 +650,7 @@ def main() -> None:
     if not all_docs:
         raise SystemExit("No documents retrieved. Check table name, terms, and date range.")
 
-    df_docs = pd.concat(all_docs, ignore_index=True).drop_duplicates(subset=["url"])
+    df_docs = pd.concat(all_docs, ignore_index=True).drop_duplicates(subset=["box_id", "url"])
     print(f"[docs] total unique docs: {len(df_docs)}", flush=True)
 
     agg = make_aggregates(df_docs, bucket_hours=int(args.bucket_hours))
@@ -688,21 +666,14 @@ def main() -> None:
     events = attach_top_sources(events, df_docs, top_n=5)
     print(f"[events] {len(events)} seed clusters", flush=True)
 
-    counts_df = load_counts(args.counts_path)
-    df_out = verify_events_against_counts(
-        events,
-        counts_df,
-        window_pad_hours=int(args.window_pad_hours),
-        min_baseline=float(args.min_baseline),
-        shock_thresh=float(args.shock_thresh),
-    )
-
+    df_out = events_to_news_seed_frame(events, bucket_hours=int(args.bucket_hours))
+  
     if df_out.empty:
-        raise SystemExit("No events matched counts. (Possible: not enough docs; terms mismatch.)")
+        raise SystemExit("No events produced. (Possible: thresholds too strict; not enough docs.)")
 
     df_out = df_out.sort_values(
-        ["impact_pass", "unique_domains", "total_articles", "event_start_utc"],
-        ascending=[False, False, False, True],
+        ["unique_domains", "total_articles", "event_start_utc"],
+        ascending=[False, False, True],
     )
     df_out.to_csv(args.out_csv, index=False)
     print(f"[ok] wrote {len(df_out)} rows -> {args.out_csv}", flush=True)
